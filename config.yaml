@@ -1,0 +1,20 @@
+env:
+  max_steps: 1000
+  n_waypoints: 50
+  waypoint_threshold: 0.2
+  arena_limit: 3.0
+
+training:
+  total_timesteps: 500000
+  n_envs: 4
+  seed: 42
+  eval_freq: 10000
+
+ppo:
+  n_steps: 2048
+  batch_size: 64
+  n_epochs: 10
+  gamma: 0.99
+  learning_rate: 0.0003
+  ent_coef: 0.005
+  clip_range: 0.2

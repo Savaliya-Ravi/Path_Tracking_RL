@@ -1,0 +1,121 @@
+<mujoco model="path_tracking_robot">
+  <compiler angle="radian" coordinate="local"/>
+  <option timestep="0.01" gravity="0 0 -9.81" integrator="RK4"/>
+
+  <default>
+    <joint damping="0.5" armature="0.01"/>
+    <geom friction="1.2 0.005 0.0001" condim="3"/>
+  </default>
+
+  <asset>
+    <texture
+      name="floor_tex"
+      type="2d"
+      builtin="checker"
+      width="512"
+      height="512"
+      rgb1="0.14 0.14 0.14"
+      rgb2="0.22 0.22 0.22"
+      mark="none"
+    />
+    <material
+      name="floor_mat"
+      texture="floor_tex"
+      texrepeat="12 12"
+      reflectance="0.1"
+    />
+    <material name="body_mat" rgba="0.20 0.45 0.80 1"/>
+    <material name="wheel_mat" rgba="0.08 0.08 0.08 1"/>
+  </asset>
+
+  <worldbody>
+    <light name="sun" pos="0 0 4" diffuse="0.9 0.9 0.9"/>
+    <geom name="floor" type="plane" size="0 0 0.05" material="floor_mat"/>
+
+    <camera
+      name="free_cam"
+      pos="0 -4.0 2.6"
+      xyaxes="1 0 0 0 0.6 0.8"
+    />
+
+    <body name="robot" pos="0 0 0.05">
+      <joint name="base_x" type="slide" axis="1 0 0" limited="false"/>
+      <joint name="base_y" type="slide" axis="0 1 0" limited="false"/>
+      <joint name="base_yaw" type="hinge" axis="0 0 1" limited="false"/>
+
+      <inertial pos="0 0 0" mass="1.0" diaginertia="0.02 0.02 0.03"/>
+
+      <geom
+        name="chassis"
+        type="box"
+        size="0.12 0.08 0.03"
+        material="body_mat"
+      />
+
+      <body name="left_wheel" pos="0 0.09 -0.015">
+        <joint
+          name="left_wheel_joint"
+          type="hinge"
+          axis="0 1 0"
+          limited="false"
+        />
+        <geom
+          name="left_wheel_geom"
+          type="cylinder"
+          size="0.035 0.015"
+          euler="1.57079632679 0 0"
+          material="wheel_mat"
+        />
+      </body>
+
+      <body name="right_wheel" pos="0 -0.09 -0.015">
+        <joint
+          name="right_wheel_joint"
+          type="hinge"
+          axis="0 1 0"
+          limited="false"
+        />
+        <geom
+          name="right_wheel_geom"
+          type="cylinder"
+          size="0.035 0.015"
+          euler="1.57079632679 0 0"
+          material="wheel_mat"
+        />
+      </body>
+
+      <site name="robot_ref" pos="0 0 0.03" size="0.01"/>
+      <site name="vel_ref" pos="0 0 0.03" size="0.01"/>
+
+      <camera
+        name="track_cam"
+        mode="trackcom"
+        pos="-1.4 0 0.8"
+        xyaxes="0 -1 0 0 0.45 1"
+      />
+    </body>
+  </worldbody>
+
+  <actuator>
+    <velocity
+      joint="left_wheel_joint"
+      kv="3.0"
+      ctrlrange="-1 1"
+      forcelimited="true"
+      forcerange="-5 5"
+    />
+    <velocity
+      joint="right_wheel_joint"
+      kv="3.0"
+      ctrlrange="-1 1"
+      forcelimited="true"
+      forcerange="-5 5"
+    />
+  </actuator>
+
+  <sensor>
+    <framepos name="robot_pos" objtype="body" objname="robot"/>
+    <framequat name="robot_quat" objtype="body" objname="robot"/>
+    <velocimeter name="robot_vel" site="vel_ref"/>
+  </sensor>
+</mujoco>
