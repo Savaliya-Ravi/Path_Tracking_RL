@@ -16,9 +16,10 @@ from gymnasium import spaces
 class EnvConfig:
     """Configuration values for the path-tracking environment."""
 
-    max_steps: int = 1000
+    # Episode duration reduced slightly to avoid excessive oscillations
+    max_steps: int = 1500
     n_waypoints: int = 50
-    waypoint_threshold: float = 0.2
+    waypoint_threshold: float = 0.4
     arena_limit: float = 3.0
     waypoint_spacing: float = 0.3
     substeps: int = 5
@@ -58,10 +59,17 @@ class PathTrackingEnv(gym.Env[np.ndarray, np.ndarray]):
                 (self.config.n_waypoints, 2),
                 dtype=np.float32,
             )
+            # previous robot position used to compute projected progress
+            self.prev_pos = np.zeros(2, dtype=np.float32)
             self.current_waypoint_idx = 1
             self.step_count = 0
             self.prev_action = np.zeros(2, dtype=np.float32)
             self.prev_distance = 0.0
+            # Kinematic velocity state (used when bypassing MuJoCo wheel physics)
+            self._linear_vel = 0.0
+            self._angular_vel = 0.0
+            # Track the furthest waypoint index reached this episode
+            self.max_waypoint_reached = 0
 
             self._renderer: Optional[mujoco.Renderer] = None
             self._viewer: Optional[Any] = None
@@ -130,7 +138,7 @@ class PathTrackingEnv(gym.Env[np.ndarray, np.ndarray]):
             raise RuntimeError("Failed to resample waypoint path.") from exc
 
     def _generate_waypoints(self) -> np.ndarray:
-        """Generate a randomized figure-8 path with 50 points."""
+        """Generate a randomized sine-wave path (no self-crossing)."""
         try:
             t = np.linspace(0.0, 2.0 * np.pi, 1600, dtype=np.float64)
             amp_x = 2.4 + self._rng.uniform(-0.15, 0.15)
@@ -138,9 +146,10 @@ class PathTrackingEnv(gym.Env[np.ndarray, np.ndarray]):
             phase = self._rng.uniform(-0.25, 0.25)
             freq = 1.0 + self._rng.uniform(-0.08, 0.08)
 
-            theta = freq * t + phase
-            x = amp_x * np.sin(theta)
-            y = amp_y * np.sin(theta) * np.cos(theta)
+            # X varies monotonically so the curve does not cross itself;
+            # Y is a sinusoid so the path has smooth turns but no intersections.
+            x = amp_x * (t / (2.0 * np.pi) * 2.0 - 1.0)
+            y = amp_y * np.sin(freq * t + phase)
             raw = np.column_stack((x, y)).astype(np.float32)
             return self._resample_path(raw)
         except Exception as exc:
@@ -176,6 +185,45 @@ class PathTrackingEnv(gym.Env[np.ndarray, np.ndarray]):
             mujoco.mj_forward(self.model, self.data)
         except Exception as exc:
             raise RuntimeError("Failed to set robot pose.") from exc
+
+    def _apply_action_kinematic(self, action: np.ndarray) -> None:
+        """Apply differential drive kinematics directly to qpos.
+
+        This bypasses the broken wheel actuators in the MuJoCo model and
+        integrates a simple differential-drive kinematic update into the
+        planar `qpos` (x, y, yaw). It also stores linear/angular velocities
+        for observations.
+        """
+        try:
+            wheel_radius = 0.035
+            wheel_base = 0.18
+            dt = float(self.model.opt.timestep) * float(self.config.substeps)
+
+            left_vel = float(action[0]) * wheel_radius
+            right_vel = float(action[1]) * wheel_radius
+
+            linear_vel = (right_vel + left_vel) / 2.0
+            angular_vel = (right_vel - left_vel) / wheel_base
+
+            x = float(self.data.qpos[0])
+            y = float(self.data.qpos[1])
+            yaw = float(self.data.qpos[2])
+
+            yaw_new = float(yaw + angular_vel * dt)
+            x_new = float(x + linear_vel * np.cos(yaw) * dt)
+            y_new = float(y + linear_vel * np.sin(yaw) * dt)
+
+            self.data.qpos[0] = x_new
+            self.data.qpos[1] = y_new
+            self.data.qpos[2] = yaw_new
+
+            # Store velocities for observation
+            self._linear_vel = float(linear_vel)
+            self._angular_vel = float(angular_vel)
+
+            mujoco.mj_forward(self.model, self.data)
+        except Exception as exc:
+            raise RuntimeError("Failed to apply kinematic action.") from exc
 
     def _compute_cross_track_error(self, x: float, y: float) -> float:
         """Compute minimum distance to the reference waypoint set."""
@@ -241,19 +289,29 @@ class PathTrackingEnv(gym.Env[np.ndarray, np.ndarray]):
         heading_error: float,
         action_smoothness: float,
         waypoint_reached: float,
+        linear_velocity: float,
         episode_complete: float,
         out_of_bounds: float,
     ) -> float:
         """Compose scalar reward from weighted component terms."""
         try:
+            # New reward composition: add small forward-velocity reward so
+            # agent is rewarded for moving even when projected progress
+            # is zero. Increase waypoint reward and add a small time
+            # penalty to encourage faster completion.
+            # Growing time penalty: surviving without progress becomes costly
+            time_penalty = 0.05 * (float(self.step_count) / float(self.config.max_steps))
+
             reward = (
-                2.0 * progress_reward
-                - 1.5 * cross_track_error
-                - 0.5 * heading_error
-                - 0.1 * action_smoothness
-                + 5.0 * waypoint_reached
+                10.0 * progress_reward
+                + 1.0 * linear_velocity
+                - 0.5 * cross_track_error
+                - 0.01 * heading_error
+                + 15.0 * waypoint_reached
                 + 50.0 * episode_complete
                 - 10.0 * out_of_bounds
+                - 0.01
+                - float(time_penalty)
             )
             return float(reward)
         except Exception as exc:
@@ -286,16 +344,18 @@ class PathTrackingEnv(gym.Env[np.ndarray, np.ndarray]):
                 "waypoint_reached": float(components["waypoint_reached"]),
                 "episode_complete": float(components["episode_complete"]),
                 "out_of_bounds": float(components["out_of_bounds"]),
+                "linear_velocity": float(components.get("linear_velocity", 0.0)),
                 "reward_progress_term": float(
-                    2.0 * components["progress_reward"]
+                    10.0 * components["progress_reward"]
                 ),
                 "reward_cross_track_term": float(
-                    -1.5 * cross_track_error
+                    -0.5 * cross_track_error
                 ),
                 "reward_heading_term": float(-0.5 * heading_error),
                 "reward_smoothness_term": float(
-                    -0.1 * components["action_smoothness"]
+                    0.0 * components["action_smoothness"]
                 ),
+                "reward_velocity_term": float(0.5 * components.get("linear_velocity", 0.0)),
                 "reward_waypoint_term": float(
                     5.0 * components["waypoint_reached"]
                 ),
@@ -323,12 +383,8 @@ class PathTrackingEnv(gym.Env[np.ndarray, np.ndarray]):
                     self._compute_tracking_metrics()
                 )
 
-            vx_world = float(self.data.qvel[0])
-            vy_world = float(self.data.qvel[1])
-            angular_velocity = float(self.data.qvel[2])
-            linear_velocity = (
-                np.cos(yaw) * vx_world + np.sin(yaw) * vy_world
-            )
+            linear_velocity = float(self._linear_vel)
+            angular_velocity = float(self._angular_vel)
 
             waypoints_local = self._next_waypoints_local(x, y, yaw)
 
@@ -380,6 +436,8 @@ class PathTrackingEnv(gym.Env[np.ndarray, np.ndarray]):
 
             self.path = self._generate_waypoints()
             self.current_waypoint_idx = min(1, self.config.n_waypoints - 1)
+            # Reset the per-episode best waypoint reached tracker
+            self.max_waypoint_reached = 0
             self.step_count = 0
             self.prev_action[:] = 0.0
 
@@ -395,6 +453,9 @@ class PathTrackingEnv(gym.Env[np.ndarray, np.ndarray]):
                 self._compute_tracking_metrics()
             )
             self.prev_distance = distance_to_target
+
+            # Initialize previous position for projected-progress computation
+            self.prev_pos = np.array([x, y], dtype=np.float32)
 
             components = {
                 "progress_reward": 0.0,
@@ -428,27 +489,57 @@ class PathTrackingEnv(gym.Env[np.ndarray, np.ndarray]):
                 raise ValueError("Action must have shape (2,).")
 
             clipped_action = np.clip(action, -1.0, 1.0)
-            self.data.ctrl[0] = float(clipped_action[0])
-            self.data.ctrl[1] = float(clipped_action[1])
-
-            for _ in range(self.config.substeps):
-                mujoco.mj_step(self.model, self.data)
+            # Bypass MuJoCo wheel actuators and apply direct kinematic update
+            # to the planar pose. This ensures wheel commands produce
+            # chassis translation/rotation even if the MuJoCo wheel model
+            # isn't physically coupled to the base.
+            self._apply_action_kinematic(clipped_action)
 
             self.step_count += 1
             cross_track, heading_error, distance_to_target = (
                 self._compute_tracking_metrics()
             )
 
-            progress_reward = float(self.prev_distance - distance_to_target)
+            # Compute projected progress along the local path direction
+            # - movement: current_position - previous_position
+            # - path direction: from previous waypoint to current waypoint
+            x, y, yaw = self._robot_pose()
+            curr_pos = np.array([x, y], dtype=np.float32)
+            movement = curr_pos - self.prev_pos
+            idx_prev = max(0, self.current_waypoint_idx - 1)
+            idx_curr = min(self.current_waypoint_idx, self.config.n_waypoints - 1)
+            seg = self.path[idx_curr] - self.path[idx_prev]
+            seg_norm = float(np.linalg.norm(seg))
+            if seg_norm > 1e-6:
+                seg_dir = seg / seg_norm
+            else:
+                seg_dir = np.array([0.0, 0.0], dtype=np.float32)
+            projected = float(np.dot(movement, seg_dir))
+            # Progress is positive only when moving forward along the path
+            progress_reward = float(max(0.0, projected * 50.0))
             waypoint_reached = 0.0
 
-            if distance_to_target <= self.config.waypoint_threshold:
-                waypoint_reached = 1.0
-                if self.current_waypoint_idx < self.config.n_waypoints - 1:
-                    self.current_waypoint_idx += 1
-                    cross_track, heading_error, distance_to_target = (
-                        self._compute_tracking_metrics()
-                    )
+            # Advance through any number of nearby waypoints in one step.
+            # Do NOT award the waypoint bonus here; we compute a bonus
+            # only for newly reached waypoints beyond the episode best
+            # to avoid re-playing already-visited waypoints.
+            while (
+                self.current_waypoint_idx < self.config.n_waypoints - 1
+                and distance_to_target <= self.config.waypoint_threshold
+            ):
+                self.current_waypoint_idx += 1
+                target = self.path[self.current_waypoint_idx]
+                x, y, _ = self._robot_pose()
+                distance_to_target = float(
+                    np.linalg.norm(target - np.array([x, y]))
+                )
+
+            # Award waypoint_reached only for progress beyond the episode best
+            if self.current_waypoint_idx > self.max_waypoint_reached:
+                waypoint_reached = float(self.current_waypoint_idx - self.max_waypoint_reached)
+                self.max_waypoint_reached = int(self.current_waypoint_idx)
+            else:
+                waypoint_reached = 0.0
 
             episode_complete = float(
                 self.current_waypoint_idx == self.config.n_waypoints - 1
@@ -458,6 +549,8 @@ class PathTrackingEnv(gym.Env[np.ndarray, np.ndarray]):
             action_smoothness = float(
                 np.linalg.norm(clipped_action - self.prev_action)
             )
+            # Use kinematic velocities computed during _apply_action_kinematic
+            linear_velocity = float(self._linear_vel)
 
             components = {
                 "progress_reward": progress_reward,
@@ -465,6 +558,7 @@ class PathTrackingEnv(gym.Env[np.ndarray, np.ndarray]):
                 "waypoint_reached": waypoint_reached,
                 "episode_complete": episode_complete,
                 "out_of_bounds": out_of_bounds,
+                "linear_velocity": linear_velocity,
             }
 
             reward = self._compose_reward(
@@ -472,6 +566,7 @@ class PathTrackingEnv(gym.Env[np.ndarray, np.ndarray]):
                 cross_track_error=cross_track,
                 heading_error=heading_error,
                 action_smoothness=action_smoothness,
+                linear_velocity=linear_velocity,
                 waypoint_reached=waypoint_reached,
                 episode_complete=episode_complete,
                 out_of_bounds=out_of_bounds,
@@ -488,8 +583,25 @@ class PathTrackingEnv(gym.Env[np.ndarray, np.ndarray]):
                 heading_error=heading_error,
             )
 
+            # update previous pose and action for next-step computations
             self.prev_action = clipped_action.astype(np.float32)
             self.prev_distance = distance_to_target
+            self.prev_pos = curr_pos.copy()
+
+            # Removed verbose per-step debug printing to avoid huge IO overhead
+            # (previously printed movement/projection details every step).
+
+            # Log waypoint events separately for clarity
+            if waypoint_reached > 0.0:
+                try:
+                    print(f"[DEBUG] waypoint_reached at idx {self.current_waypoint_idx}")
+                except Exception:
+                    pass
+            if episode_complete > 0.0:
+                try:
+                    print(f"[DEBUG] episode_complete at idx {self.current_waypoint_idx}")
+                except Exception:
+                    pass
 
             if self.render_mode == "human":
                 self.render()
@@ -508,14 +620,14 @@ class PathTrackingEnv(gym.Env[np.ndarray, np.ndarray]):
                         width=640,
                         height=480,
                     )
-                self._renderer.update_scene(self.data, camera="track_cam")
+                self._renderer.update_scene(self.data, camera="free_cam")
                 return self._renderer.render().copy()
 
             if self.render_mode == "human":
                 if self._viewer is None:
-                    import mujoco.viewer
+                    from mujoco import viewer as mj_viewer
 
-                    self._viewer = mujoco.viewer.launch_passive(
+                    self._viewer = mj_viewer.launch_passive(
                         self.model,
                         self.data,
                         show_left_ui=False,

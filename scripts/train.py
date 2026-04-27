@@ -203,16 +203,26 @@ def train(args: argparse.Namespace) -> None:
         )
         callback = CallbackList([TensorboardCallback(), eval_callback])
 
+        # Read PPO hyperparameters from config with sensible defaults
+        ppo_cfg = config.get("ppo", {})
+        ppo_n_steps = int(ppo_cfg.get("n_steps", 2048))
+        ppo_batch_size = int(ppo_cfg.get("batch_size", 64))
+        ppo_n_epochs = int(ppo_cfg.get("n_epochs", 10))
+        ppo_gamma = float(ppo_cfg.get("gamma", 0.99))
+        ppo_lr = float(ppo_cfg.get("learning_rate", 3e-4))
+        ppo_ent = float(ppo_cfg.get("ent_coef", 0.005))
+        ppo_clip = float(ppo_cfg.get("clip_range", 0.2))
+
         model = PPO(
             policy="MlpPolicy",
             env=train_env,
-            n_steps=2048,
-            batch_size=64,
-            n_epochs=10,
-            gamma=0.99,
-            learning_rate=3e-4,
-            ent_coef=0.005,
-            clip_range=0.2,
+            n_steps=ppo_n_steps,
+            batch_size=ppo_batch_size,
+            n_epochs=ppo_n_epochs,
+            gamma=ppo_gamma,
+            learning_rate=ppo_lr,
+            ent_coef=ppo_ent,
+            clip_range=ppo_clip,
             gae_lambda=0.95,
             tensorboard_log=str(logs_dir),
             seed=args.seed,

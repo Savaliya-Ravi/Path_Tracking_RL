@@ -97,19 +97,20 @@
   </worldbody>
 
   <actuator>
+    <!-- Increased actuator gain and force limits to allow higher top speed -->
     <velocity
       joint="left_wheel_joint"
-      kv="3.0"
+      kv="10.0"
       ctrlrange="-1 1"
       forcelimited="true"
-      forcerange="-5 5"
+      forcerange="-30 30"
     />
     <velocity
       joint="right_wheel_joint"
-      kv="3.0"
+      kv="10.0"
       ctrlrange="-1 1"
       forcelimited="true"
-      forcerange="-5 5"
+      forcerange="-30 30"
     />
   </actuator>
 

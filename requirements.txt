@@ -8,3 +8,4 @@ pandas==3.0.2
 PyYAML==6.0.2
 pytest==8.3.5
 flake8==7.1.2
+Pillow==12.2.0

@@ -105,9 +105,26 @@ cd path_tracking_rl
 conda run -p ../.conda311 python scripts/evaluate.py --episodes 10
 ```
 
+Live MuJoCo viewer:
+
+```bash
+cd path_tracking_rl
+conda run -p ../.conda311 python scripts/evaluate.py --episodes 1 --render
+```
+
+Record robot motion as GIF:
+
+```bash
+cd path_tracking_rl
+conda run -p ../.conda311 python scripts/evaluate.py \
+  --episodes 1 \
+  --record-gif robot_motion.gif
+```
+
 Metrics are saved to:
 
 - results/eval_metrics.csv
+- results/robot_motion.gif
 
 ## Visualize
 
