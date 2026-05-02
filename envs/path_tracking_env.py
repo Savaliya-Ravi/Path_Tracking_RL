@@ -16,13 +16,13 @@ from gymnasium import spaces
 class EnvConfig:
     """Configuration values for the path-tracking environment."""
 
-    # Episode duration reduced slightly to avoid excessive oscillations
-    max_steps: int = 1500
-    n_waypoints: int = 50
-    waypoint_threshold: float = 0.4
+    max_steps: int = 2500
+    n_waypoints: int = 25
+    waypoint_threshold: float = 0.15
     arena_limit: float = 3.0
     waypoint_spacing: float = 0.3
     substeps: int = 5
+    path_type: str = "figure8"  # "sine" or "figure8"
 
 
 class PathTrackingEnv(gym.Env[np.ndarray, np.ndarray]):
@@ -65,9 +65,8 @@ class PathTrackingEnv(gym.Env[np.ndarray, np.ndarray]):
             self.step_count = 0
             self.prev_action = np.zeros(2, dtype=np.float32)
             self.prev_distance = 0.0
-            # Kinematic velocity state (used when bypassing MuJoCo wheel physics)
-            self._linear_vel = 0.0
-            self._angular_vel = 0.0
+            self._linear_vel: float = 0.0
+            self._angular_vel: float = 0.0
             # Track the furthest waypoint index reached this episode
             self.max_waypoint_reached = 0
 
@@ -138,22 +137,46 @@ class PathTrackingEnv(gym.Env[np.ndarray, np.ndarray]):
             raise RuntimeError("Failed to resample waypoint path.") from exc
 
     def _generate_waypoints(self) -> np.ndarray:
-        """Generate a randomized sine-wave path (no self-crossing)."""
+        """Generate a waypoint path for the configured shape."""
         try:
-            t = np.linspace(0.0, 2.0 * np.pi, 1600, dtype=np.float64)
-            amp_x = 2.4 + self._rng.uniform(-0.15, 0.15)
-            amp_y = 1.2 + self._rng.uniform(-0.10, 0.10)
-            phase = self._rng.uniform(-0.25, 0.25)
-            freq = 1.0 + self._rng.uniform(-0.08, 0.08)
-
-            # X varies monotonically so the curve does not cross itself;
-            # Y is a sinusoid so the path has smooth turns but no intersections.
-            x = amp_x * (t / (2.0 * np.pi) * 2.0 - 1.0)
-            y = amp_y * np.sin(freq * t + phase)
-            raw = np.column_stack((x, y)).astype(np.float32)
-            return self._resample_path(raw)
+            if self.config.path_type == "sine":
+                return self._generate_sine_waypoints()
+            if self.config.path_type == "figure8":
+                return self._generate_figure8_waypoints()
+            raise ValueError(
+                f"Unsupported path_type: {self.config.path_type}"
+            )
         except Exception as exc:
             raise RuntimeError("Failed to generate waypoints.") from exc
+
+    def _generate_sine_waypoints(self) -> np.ndarray:
+        """Generate a randomized sine-wave path (no self-crossing)."""
+        t = np.linspace(0.0, 2.0 * np.pi, 1600, dtype=np.float64)
+        amp_x = 2.4 + self._rng.uniform(-0.15, 0.15)
+        amp_y = 1.2 + self._rng.uniform(-0.10, 0.10)
+        phase = self._rng.uniform(-0.25, 0.25)
+        freq = 1.0 + self._rng.uniform(-0.08, 0.08)
+
+        # X varies monotonically so the curve does not cross itself;
+        # Y is a sinusoid so the path has smooth turns but no intersections.
+        x = amp_x * (t / (2.0 * np.pi) * 2.0 - 1.0)
+        y = amp_y * np.sin(freq * t + phase)
+        raw = np.column_stack((x, y)).astype(np.float32)
+        return self._resample_path(raw)
+
+    def _generate_figure8_waypoints(self) -> np.ndarray:
+        """Generate a randomized figure-8 path (self-crossing)."""
+        t = np.linspace(0.0, 2.0 * np.pi, 1600, dtype=np.float64)
+        amp_x = 2.4 + self._rng.uniform(-0.15, 0.15)
+        amp_y = 1.2 + self._rng.uniform(-0.10, 0.10)
+        phase = self._rng.uniform(-0.25, 0.25)
+        freq = 1.0 + self._rng.uniform(-0.08, 0.08)
+
+        theta = freq * t + phase
+        x = amp_x * np.sin(theta)
+        y = amp_y * np.sin(theta) * np.cos(theta)
+        raw = np.column_stack((x, y)).astype(np.float32)
+        return self._resample_path(raw)
 
     @staticmethod
     def _wrap_angle(angle: float) -> float:
@@ -197,10 +220,11 @@ class PathTrackingEnv(gym.Env[np.ndarray, np.ndarray]):
         try:
             wheel_radius = 0.035
             wheel_base = 0.18
+            max_wheel_speed = 12.0
             dt = float(self.model.opt.timestep) * float(self.config.substeps)
 
-            left_vel = float(action[0]) * wheel_radius
-            right_vel = float(action[1]) * wheel_radius
+            left_vel = float(action[0]) * max_wheel_speed * wheel_radius
+            right_vel = float(action[1]) * max_wheel_speed * wheel_radius
 
             linear_vel = (right_vel + left_vel) / 2.0
             angular_vel = (right_vel - left_vel) / wheel_base
@@ -489,11 +513,28 @@ class PathTrackingEnv(gym.Env[np.ndarray, np.ndarray]):
                 raise ValueError("Action must have shape (2,).")
 
             clipped_action = np.clip(action, -1.0, 1.0)
-            # Bypass MuJoCo wheel actuators and apply direct kinematic update
-            # to the planar pose. This ensures wheel commands produce
-            # chassis translation/rotation even if the MuJoCo wheel model
-            # isn't physically coupled to the base.
-            self._apply_action_kinematic(clipped_action)
+            # Differential drive kinematic model (apply inline so we
+            # directly update chassis pose without relying on MuJoCo
+            # wheel actuators which were not coupled to the base).
+            wheel_radius = 0.035
+            wheel_base = 0.18
+            max_wheel_speed = 12.0
+            dt = float(self.model.opt.timestep) * float(self.config.substeps)
+
+            left_vel = float(clipped_action[0]) * max_wheel_speed * wheel_radius
+            right_vel = float(clipped_action[1]) * max_wheel_speed * wheel_radius
+            self._linear_vel = (right_vel + left_vel) / 2.0
+            self._angular_vel = (right_vel - left_vel) / wheel_base
+
+            x_cur, y_cur, yaw_cur = self._robot_pose()
+            yaw_new = float(yaw_cur + self._angular_vel * dt)
+            x_new = float(x_cur + self._linear_vel * np.cos(yaw_cur) * dt)
+            y_new = float(y_cur + self._linear_vel * np.sin(yaw_cur) * dt)
+
+            self.data.qpos[0] = x_new
+            self.data.qpos[1] = y_new
+            self.data.qpos[2] = yaw_new
+            mujoco.mj_forward(self.model, self.data)
 
             self.step_count += 1
             cross_track, heading_error, distance_to_target = (
@@ -516,7 +557,9 @@ class PathTrackingEnv(gym.Env[np.ndarray, np.ndarray]):
                 seg_dir = np.array([0.0, 0.0], dtype=np.float32)
             projected = float(np.dot(movement, seg_dir))
             # Progress is positive only when moving forward along the path
-            progress_reward = float(max(0.0, projected * 50.0))
+            # Use raw projected distance (do not multiply) now that we
+            # integrate true kinematics.
+            progress_reward = float(max(0.0, projected))
             waypoint_reached = 0.0
 
             # Advance through any number of nearby waypoints in one step.
@@ -549,7 +592,6 @@ class PathTrackingEnv(gym.Env[np.ndarray, np.ndarray]):
             action_smoothness = float(
                 np.linalg.norm(clipped_action - self.prev_action)
             )
-            # Use kinematic velocities computed during _apply_action_kinematic
             linear_velocity = float(self._linear_vel)
 
             components = {

@@ -1,8 +1,10 @@
 env:
-  max_steps: 1000
-  n_waypoints: 25
-  waypoint_threshold: 0.2
+  max_steps: 4000
+  n_waypoints: 40
+  waypoint_threshold: 0.25
   arena_limit: 3.0
+  waypoint_spacing: 0.3
+  path_type: "figure8"
 
 training:
   total_timesteps: 2000000
